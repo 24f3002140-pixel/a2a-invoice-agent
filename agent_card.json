@@ -1,0 +1,38 @@
+{
+  "name": "Invoice Action Agent",
+  "description": "An A2A invoice reconciliation agent that proposes evidence-backed business actions and executes only approved proposals.",
+  "version": "1.0.0",
+  "capabilities": {
+    "streaming": false,
+    "pushNotifications": false,
+    "stateTransitionHistory": true
+  },
+  "supportedInterfaces": [
+    {
+      "url": "https://YOUR-RENDER-SERVICE.onrender.com/a2a/",
+      "protocolBinding": "HTTP+JSON",
+      "protocolVersion": "1.0"
+    }
+  ],
+  "defaultInputModes": [
+    "application/vnd.ga5.invoice-claim-batch+json"
+  ],
+  "defaultOutputModes": [
+    "application/vnd.ga5.invoice-action-proposals+json",
+    "application/vnd.ga5.invoice-action-receipts+json"
+  ],
+  "skills": [
+    {
+      "id": "invoice_action_agent",
+      "name": "Invoice Action Agent",
+      "description": "Reconciles invoice packages and selects one safe business action for each package.",
+      "tags": [
+        "invoice",
+        "reconciliation",
+        "payments",
+        "approval",
+        "evidence"
+      ]
+    }
+  ]
+}
