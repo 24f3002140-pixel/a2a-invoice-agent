@@ -20,7 +20,7 @@ from storage import (
     canonical_json,
     complete_task,
     create_initial_task,
-    get_many_cached_decisions,
+    get_cached_decision,
     get_task,
     get_task_with_proposals,
     hash_json,
@@ -31,10 +31,6 @@ from storage import (
     save_many_cached_decisions,
 )
 
-
-# ============================================================
-# Constants
-# ============================================================
 
 A2A_VERSION = "1.0"
 A2A_MEDIA_TYPE = "application/a2a+json"
@@ -70,11 +66,6 @@ TERMINAL_STATES = {
 
 MAX_RESPONSE_BYTES = 512 * 1024
 
-
-# ============================================================
-# Configuration
-# ============================================================
-
 PUBLIC_BASE_URL = os.getenv(
     "PUBLIC_BASE_URL",
     "https://placeholder.onrender.com/a2a/",
@@ -83,10 +74,6 @@ PUBLIC_BASE_URL = os.getenv(
 if not PUBLIC_BASE_URL.endswith("/"):
     PUBLIC_BASE_URL += "/"
 
-
-# ============================================================
-# FastAPI application
-# ============================================================
 
 app = FastAPI(
     title="A2A Invoice Action Agent",
@@ -103,10 +90,6 @@ def startup_event() -> None:
     initialize_database()
 
 
-# ============================================================
-# In-process locks
-# ============================================================
-
 _lock_registry_guard = asyncio.Lock()
 _request_locks: Dict[str, asyncio.Lock] = {}
 
@@ -121,10 +104,6 @@ async def get_request_lock(key: str) -> asyncio.Lock:
 
         return lock
 
-
-# ============================================================
-# General helpers
-# ============================================================
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -146,6 +125,21 @@ def make_action_id(
     ).hexdigest()
 
     return f"act_{digest[:28]}"
+
+
+def semantic_package_hash(
+    package: Dict[str, Any],
+) -> str:
+    """
+    Cache by semantic package content rather than delivery namespace.
+
+    packageId may change between Check and Save, so it is removed before
+    hashing. All remaining package content is canonicalized recursively.
+    """
+    semantic_package = copy.deepcopy(package)
+    semantic_package.pop("packageId", None)
+
+    return hash_json(semantic_package)
 
 
 def request_content_type(request: Request) -> str:
@@ -225,10 +219,6 @@ async def read_json_body(
 
     return body, None
 
-
-# ============================================================
-# Authentication and protocol validation
-# ============================================================
 
 def get_bearer_token(
     request: Request,
@@ -310,8 +300,8 @@ def validate_protected_request(
         return None, version_error
 
     if require_content_type:
-        content_type_error = (
-            validate_a2a_content_type(request)
+        content_type_error = validate_a2a_content_type(
+            request
         )
 
         if content_type_error is not None:
@@ -319,10 +309,6 @@ def validate_protected_request(
 
     return hash_principal(token), None
 
-
-# ============================================================
-# Message validation
-# ============================================================
 
 def find_message_part(
     message: Dict[str, Any],
@@ -356,7 +342,9 @@ def find_message_part(
     data = part.get("data")
 
     if not isinstance(data, dict):
-        return None, "The Part requires object-valued data."
+        return None, (
+            "The Part requires object-valued data."
+        )
 
     return part, None
 
@@ -450,10 +438,6 @@ def validate_output_modes(
     return None
 
 
-# ============================================================
-# Task helpers
-# ============================================================
-
 def get_task_state(
     task: Dict[str, Any],
 ) -> Optional[str]:
@@ -470,6 +454,15 @@ def get_task_state(
     return state
 
 
+def create_task_status(
+    state: str,
+) -> Dict[str, str]:
+    return {
+        "state": state,
+        "timestamp": utc_now(),
+    }
+
+
 def make_artifact(
     media_type: str,
     data: Dict[str, Any],
@@ -484,15 +477,6 @@ def make_artifact(
                 "data": data,
             }
         ],
-    }
-
-
-def create_task_status(
-    state: str,
-) -> Dict[str, str]:
-    return {
-        "state": state,
-        "timestamp": utc_now(),
     }
 
 
@@ -537,16 +521,20 @@ def index_stored_proposals(
     return proposal_index
 
 
-# ============================================================
-# Public routes
-# ============================================================
-
 @app.get("/")
 async def root() -> Dict[str, Any]:
     return {
         "service": "A2A Invoice Action Agent",
         "healthy": database_healthcheck(),
     }
+
+
+@app.head("/")
+async def root_head() -> JSONResponse:
+    return JSONResponse(
+        status_code=200,
+        content={},
+    )
 
 
 @app.get("/health")
@@ -565,9 +553,9 @@ async def agent_card() -> JSONResponse:
     card = {
         "name": "Invoice Action Agent",
         "description": (
-            "An A2A invoice reconciliation agent that "
-            "returns evidence-backed business-action proposals "
-            "and executes only accepted proposals."
+            "An A2A invoice reconciliation agent that returns "
+            "evidence-backed business-action proposals and executes "
+            "only accepted proposals."
         ),
         "version": "1.0.0",
         "capabilities": {
@@ -614,10 +602,6 @@ async def agent_card() -> JSONResponse:
         content=card,
     )
 
-
-# ============================================================
-# Initial invoice batch
-# ============================================================
 
 async def process_initial_message(
     body: Dict[str, Any],
@@ -731,9 +715,31 @@ async def process_initial_message(
         task_id = new_id("task")
         context_id = new_id("context")
 
-        cached_decisions, uncached_items = (
-            get_many_cached_decisions(packages)
-        )
+        cached_by_hash: Dict[str, Dict[str, Any]] = {}
+        uncached_items: List[
+            Tuple[str, Dict[str, Any]]
+        ] = []
+
+        for package in packages:
+            package_hash = semantic_package_hash(
+                package
+            )
+
+            cached_decision = get_cached_decision(
+                package_hash
+            )
+
+            if cached_decision is None:
+                uncached_items.append(
+                    (
+                        package_hash,
+                        package,
+                    )
+                )
+            else:
+                cached_by_hash[
+                    package_hash
+                ] = cached_decision
 
         uncached_packages = [
             package
@@ -753,17 +759,32 @@ async def process_initial_message(
                         policy_revision,
                     )
                 )
+
             except AIError as exc:
-                return error_response(
-                    502,
-                    "AI_DECISION_FAILED",
-                    str(exc),
+                print(
+                    f"AI_DECISION_FAILED: {exc}",
+                    flush=True,
                 )
-            except Exception:
+
                 return error_response(
                     502,
                     "AI_DECISION_FAILED",
-                    "The invoice decision provider failed.",
+                    "The invoice decision provider could not "
+                    "complete the batch.",
+                )
+
+            except Exception as exc:
+                print(
+                    f"UNEXPECTED_AI_ERROR: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+                return error_response(
+                    502,
+                    "AI_DECISION_FAILED",
+                    "The invoice decision provider could not "
+                    "complete the batch.",
                 )
 
             generated_by_package = {
@@ -809,9 +830,11 @@ async def process_initial_message(
 
         for package in packages:
             package_id = package["packageId"]
-            package_hash = hash_json(package)
+            package_hash = semantic_package_hash(
+                package
+            )
 
-            decision = cached_decisions.get(
+            decision = cached_by_hash.get(
                 package_hash
             )
 
@@ -851,20 +874,22 @@ async def process_initial_message(
 
             action_ids.add(action_id)
 
-            proposal = {
-                "packageId": package_id,
-                "actionId": action_id,
-                "action": action,
-                "facts": copy.deepcopy(
-                    decision.get("facts")
-                ),
-                "evidenceRefs": copy.deepcopy(
-                    decision.get("evidenceRefs")
-                ),
-                "rationale": decision.get("rationale"),
-            }
-
-            proposals.append(proposal)
+            proposals.append(
+                {
+                    "packageId": package_id,
+                    "actionId": action_id,
+                    "action": action,
+                    "facts": copy.deepcopy(
+                        decision.get("facts")
+                    ),
+                    "evidenceRefs": copy.deepcopy(
+                        decision.get("evidenceRefs")
+                    ),
+                    "rationale": decision.get(
+                        "rationale"
+                    ),
+                }
+            )
 
         proposal_data = {
             "batchId": batch_id,
@@ -904,6 +929,7 @@ async def process_initial_message(
                     proposals=proposal_data,
                 )
             )
+
         except IdempotencyConflictError:
             return error_response(
                 409,
@@ -917,10 +943,6 @@ async def process_initial_message(
             }
         )
 
-
-# ============================================================
-# Result continuation
-# ============================================================
 
 async def process_result_message(
     message: Dict[str, Any],
@@ -971,11 +993,13 @@ async def process_result_message(
                 message_id=message_id,
                 message_hash=message_hash,
             )
+
         except IdempotencyConflictError:
             return error_response(
                 409,
                 "IDEMPOTENCY_CONFLICT",
-                "The continuation message ID was reused with different content.",
+                "The continuation message ID was reused with "
+                "different content.",
             )
 
         if replay_task is not None:
@@ -990,6 +1014,7 @@ async def process_result_message(
                 task_id,
                 principal_hash,
             )
+
         except TaskNotFoundError:
             return error_response(
                 404,
@@ -1060,6 +1085,7 @@ async def process_result_message(
             proposal_index = index_stored_proposals(
                 proposal_data
             )
+
         except TaskConflictError:
             return error_response(
                 409,
@@ -1239,18 +1265,22 @@ async def process_result_message(
                 completed_task=completed_task,
                 receipts=receipt_data,
             )
+
         except IdempotencyConflictError:
             return error_response(
                 409,
                 "IDEMPOTENCY_CONFLICT",
-                "The continuation message ID was reused with different content.",
+                "The continuation message ID was reused with "
+                "different content.",
             )
+
         except TaskNotFoundError:
             return error_response(
                 404,
                 "TASK_NOT_FOUND",
                 "The requested task was not found.",
             )
+
         except TaskConflictError:
             return error_response(
                 409,
@@ -1264,10 +1294,6 @@ async def process_result_message(
             }
         )
 
-
-# ============================================================
-# POST /a2a/message:send
-# ============================================================
 
 @app.post("/a2a/message:send")
 @app.post("/a2a/message:send/")
@@ -1320,10 +1346,6 @@ async def message_send(
     )
 
 
-# ============================================================
-# GET /a2a/tasks
-# ============================================================
-
 @app.get("/a2a/tasks")
 @app.get("/a2a/tasks/")
 async def get_tasks(
@@ -1336,18 +1358,14 @@ async def get_tasks(
     if protection_error is not None:
         return protection_error
 
-    tasks = list_tasks(principal_hash)
-
     return a2a_response(
         {
-            "tasks": tasks,
+            "tasks": list_tasks(
+                principal_hash
+            ),
         }
     )
 
-
-# ============================================================
-# GET /a2a/tasks/{task_id}
-# ============================================================
 
 @app.get("/a2a/tasks/{task_id}")
 @app.get("/a2a/tasks/{task_id}/")
@@ -1367,6 +1385,7 @@ async def get_single_task(
             task_id,
             principal_hash,
         )
+
     except TaskNotFoundError:
         return error_response(
             404,
@@ -1376,10 +1395,6 @@ async def get_single_task(
 
     return a2a_response(task)
 
-
-# ============================================================
-# POST /a2a/tasks/{task_id}:cancel
-# ============================================================
 
 @app.post("/a2a/tasks/{task_id}:cancel")
 @app.post("/a2a/tasks/{task_id}:cancel/")
@@ -1407,6 +1422,7 @@ async def cancel_existing_task(
                 task_id,
                 principal_hash,
             )
+
         except TaskNotFoundError:
             return error_response(
                 404,
@@ -1435,11 +1451,9 @@ async def cancel_existing_task(
             )
         )
 
-        existing_artifacts = (
-            canceled_task.get(
-                "artifacts",
-                [],
-            )
+        existing_artifacts = canceled_task.get(
+            "artifacts",
+            [],
         )
 
         retained_artifacts = []
@@ -1449,15 +1463,15 @@ async def cancel_existing_task(
                 if not isinstance(artifact, dict):
                     continue
 
-                parts = artifact.get(
+                artifact_parts = artifact.get(
                     "parts",
                     [],
                 )
 
                 contains_receipt = False
 
-                if isinstance(parts, list):
-                    for artifact_part in parts:
+                if isinstance(artifact_parts, list):
+                    for artifact_part in artifact_parts:
                         if (
                             isinstance(
                                 artifact_part,
@@ -1486,12 +1500,14 @@ async def cancel_existing_task(
                 principal_hash=principal_hash,
                 canceled_task=canceled_task,
             )
+
         except TaskNotFoundError:
             return error_response(
                 404,
                 "TASK_NOT_FOUND",
                 "The requested task was not found.",
             )
+
         except TaskConflictError:
             return error_response(
                 409,
